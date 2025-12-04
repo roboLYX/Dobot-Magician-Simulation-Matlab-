@@ -1,0 +1,191 @@
+%% Dobot 3R 简化模型：IK -> 关节轨迹 -> FK 生成末端轨迹
+% 流程：
+% 1) 已知 4 个末端位姿 P1~P4
+% 2) 利用逆运动学 ikcon 求出每个点的关节角 q_wp(i,:)
+% 3) 用这些关节角先做一次 FK，验证关键点是否到位
+% 4) 在关节空间对 q_wp 做 jtraj 插值得到 q_traj
+% 5) 对整个 q_traj 做 FK，得到连续末端轨迹，并绘制位置 & 关节角速度
+
+clc; clear; close all;
+
+%% 1. 按给定 DH 建 3R 机械臂（标准 DH）
+% DH 表（相对于肩关节坐标系）：
+% L   theta_i   alpha_i   d_i   a_i
+% 1    θ1       -pi/2      8     0
+% 2    θ2        0         0    135
+% 3    θ3        0         0    147
+
+alpha = [-pi/2, 0, 0];
+d     = [8,      0, 0];
+a     = [0,    135, 147];
+
+L(1) = Link([0, d(1), a(1), alpha(1)], 'standard');
+L(2) = Link([0, d(2), a(2), alpha(2)], 'standard');
+L(3) = Link([0, d(3), a(3), alpha(3)], 'standard');
+%SDH通过图中的alpha角和a进行验证
+L(2).offset = -pi/2;  %实机的零位和仿真的零位矫正：仿真的时候零位设置成了大臂平行于x-y平面时为0，但在实机中当大臂竖直时为0
+% 关节范围（参考手册：大臂 0~85°，小臂 -10~90°）
+L(3).offset = pi/2;
+L(2).qlim = [  0,  85] * pi/180;   % J2：大臂
+L(3).qlim = [-10, 90] * pi/180;   % J3：小臂
+
+robot = SerialLink(L, 'name', 'Dobot_3R');
+
+% === 底座坐标：将整机向下平移 8 mm，使肩关节(J2)成为世界原点(0,0,0) ===
+robot.base = transl(0, 0, -8);
+teach(robot);   % 需要交互调整时再打开
+%% 2. 定义 4 个末端目标点（TCP 在世界坐标 Σ0 下的坐标，单位 mm）
+% 注意：这些是 TCP 的期望位置，姿态默认取 R = I（单位矩阵）
+
+P1 = [150,   50,  -50];    % 拾取橡皮
+P2 = [150,   50,   50];    % 垂直抬高
+P3 = [-150, 150,   50];    % 水平移动
+P4 = [-150, 150,   -50];    % 放下橡皮
+
+P_list = [P1; P2; P3; P4];
+
+T = cell(4,1);
+for i = 1:4
+    T{i} = transl(P_list(i,:));   % 只指定末端位置
+end
+
+%% 3. 逆运动学：对 4 个点分别求关节角 q_wp(i,:)
+
+q_wp = zeros(4,3);   % 存 4 个点的关节解
+
+% 初始猜测：一个上肘姿态（不是实机数据）
+q_guess = [0, -60, 60] * pi/180;
+
+% 第 1 个点：以 q_guess 为初值
+q_wp(1,:) = robot.ikcon(T{1}, q_guess);
+
+% 其余点：以上一个点的解为初值，保证解的连续性 & 一直在上肘分支
+for i = 2:4
+    q_wp(i,:) = robot.ikcon(T{i}, q_wp(i-1,:));
+end
+
+disp('=== 4 个点的关节角（弧度） ===');
+disp(q_wp);
+disp('=== 4 个点的关节角（角度） ===');
+disp(rad2deg(q_wp));
+
+%% 3.5 用 FK 检查这 4 个离散点是否基本到达目标位置
+
+T_wp = robot.fkine(q_wp);     % 对 4 个姿态做 FK（包含 base 和 tool）
+p_wp = transl(T_wp);          % 4×3，每一行为 TCP 的 (x,y,z)
+
+disp('=== 4 个点用 FK 计算得到的 TCP 位置（mm） ===');
+disp(p_wp);
+
+% 对比表 (目标位置 vs FK 结果)，你可以在命令行看
+compare_tbl = table(P_list(:,1), P_list(:,2), P_list(:,3), ...
+                    p_wp(:,1),  p_wp(:,2),  p_wp(:,3), ...
+    'VariableNames', {'Px_des','Py_des','Pz_des','Px_fk','Py_fk','Pz_fk'});
+disp(compare_tbl);
+
+% 3.6 误差分析：仿真 TCP 坐标 vs 期望/实机 TCP 坐标
+% 绝对误差（mm）
+err_abs = p_wp - P_list;              % 每个点的 (Δx, Δy, Δz)
+err_abs_norm = sqrt(sum(err_abs.^2, 2));  % 每个点的空间距离误差 ||Δp||
+
+% 期望坐标的模长（mm），用于算相对误差
+P_norm = sqrt(sum(P_list.^2, 2));
+
+% 相对误差（按欧氏距离）： ||Δp|| / ||p_des||
+rel_err = err_abs_norm ./ max(P_norm, 1e-6);   % 防止除 0
+
+% 如果你想看各个坐标分量的相对误差，也可以这样：
+rel_err_xyz = abs(err_abs) ./ max(abs(P_list), 1e-6);
+
+% 做一个误差表，方便在命令行看
+err_tbl = table( ...
+    P_list(:,1), P_list(:,2), P_list(:,3), ...          % 期望坐标
+    p_wp(:,1),   p_wp(:,2),   p_wp(:,3),   ...          % 仿真 FK 坐标
+    err_abs(:,1), err_abs(:,2), err_abs(:,3), ...       % 绝对误差
+    rel_err_xyz(:,1), rel_err_xyz(:,2), rel_err_xyz(:,3), ...  % 各轴相对误差
+    err_abs_norm, rel_err, ...                          % 欧氏距离 & 相对误差
+    'VariableNames', { ...
+        'Px_des','Py_des','Pz_des', ...
+        'Px_fk','Py_fk','Pz_fk', ...
+        'Ex','Ey','Ez', ...
+        'RelEx','RelEy','RelEz', ...
+        'ErrNorm','RelErrNorm' ...
+    });
+
+disp('=== 各点末端位置的绝对误差 / 相对误差 ===');
+disp(err_tbl);
+
+% 最大误差
+[maxErrNorm, idxMax] = max(err_abs_norm);
+fprintf('最大位置欧氏误差 = %.3f mm，对应第 %d 个点。\n', maxErrNorm, idxMax);
+fprintf('对应的相对误差 = %.4f\n', rel_err(idxMax));
+%% 4. 关节空间插值：P1->P2, P2->P3, P3->P4 三段 jtraj
+
+N = 10;   % 每段插值点数
+
+q_traj = [];
+for i = 1:3
+    [q_seg, ~, ~] = jtraj(q_wp(i,:), q_wp(i+1,:), N);
+    if i == 1
+        q_traj = q_seg;
+    else
+        q_traj = [q_traj; q_seg(2:end,:)];  % 去掉重复点
+    end
+end
+
+%% 5. 用正运动学算整条末端轨迹（FK on q_traj）
+
+T_fk = robot.fkine(q_traj);   % 对每一帧做 FK（已包含 base 和 tool）
+p_fk = transl(T_fk);          % M×3，TCP 真实轨迹
+
+figure;
+plot3(p_fk(:,1), p_fk(:,2), p_fk(:,3), 'b-', 'LineWidth', 2); hold on;
+
+% 把 4 个目标点画出来
+plot3(P1(1), P1(2), P1(3), 'ro', 'MarkerSize', 8, 'LineWidth', 2);
+plot3(P2(1), P2(2), P2(3), 'go', 'MarkerSize', 8, 'LineWidth', 2);
+plot3(P3(1), P3(2), P3(3), 'ko', 'MarkerSize', 8, 'LineWidth', 2);
+plot3(P4(1), P4(2), P4(3), 'mo', 'MarkerSize', 8, 'LineWidth', 2);
+
+grid on; axis equal;
+xlabel('X / mm'); ylabel('Y / mm'); zlabel('Z / mm');
+title('TCP 真实路径（IK -> jtraj -> FK）');
+legend('TCP 轨迹','P1','P2','P3','P4');
+
+%% 6. 计算关节角速度并绘图
+
+dt = 1;   % 先设每个插值点之间的时间间隔为 1 s（形状正确，数值可后调）
+
+qd_traj = diff(q_traj) / dt;            % 尺寸：(N_total-1) × 3
+t_qd    = (1:size(qd_traj,1)) * dt;     % 对应时间轴
+
+figure;
+subplot(3,1,1);
+plot(t_qd, qd_traj(:,1), 'LineWidth', 1.5);
+grid on;
+ylabel('\omega_1 [rad/s]');
+title('关节 1 角速度');
+
+subplot(3,1,2);
+plot(t_qd, qd_traj(:,2), 'LineWidth', 1.5);
+grid on;
+ylabel('\omega_2 [rad/s]');
+title('关节 2 角速度');
+
+subplot(3,1,3);
+plot(t_qd, qd_traj(:,3), 'LineWidth', 1.5);
+grid on;
+xlabel('t [s]');
+ylabel('\omega_3 [rad/s]');
+title('关节 3 角速度');
+
+sgtitle('三关节角速度曲线');
+
+%% 7. 动画演示整个运动过程
+
+figure;
+robot.plot(q_traj, ...
+    'trail', {'r', 'LineWidth', 1.5}, ...
+    'nowrist', 'noname');
+title('Dobot 3R 简化模型：4 点关节空间轨迹');
+grid on;
