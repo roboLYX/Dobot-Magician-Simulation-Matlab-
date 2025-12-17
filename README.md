@@ -140,11 +140,6 @@ So simulation ≠ real robot.
 	•	Add minimum-jerk trajectory
 	•	Calibrate DH using real robot data
 
-⸻
-
-📦 License｜许可证
-
-MIT License (自由使用)
 
 ⸻
 
